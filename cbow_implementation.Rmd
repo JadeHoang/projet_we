@@ -1,0 +1,315 @@
+---
+title: "Word Embedding Project"
+author: "HOANG Bich Ngoc, Claire-Sophie Maroni"
+date: "December 28, 2018"
+output: html_document
+---
+
+Packages to instal and load
+```{r, echo = F}
+install.packages("text2vec")
+install.packages("dplyr")
+install.packages("svMisc")
+install.packages("doParallel")
+library(text2vec)
+library(MASS)
+library(dplyr)
+library(doParallel)
+```
+
+Read and tokenize the corpus *text8*
+```{r}
+#read data
+corpus <- readLines('text8', n=1, warn=FALSE)
+#tokenize corpus by space
+words_list <- unlist(space_tokenizer(corpus))[-1]
+length(words_list)
+```
+Cut down to 1 millions words
+```{r}
+words_list <- words_list[seq(1000000)]
+length(words_list)
+corpus <- paste(words_list)
+```
+
+
+Processing data 
+```{r}
+vocabulary_size <- 20000
+
+#iterator token
+iterator <- itoken(corpus, tokenizer=space_tokenizer, progressbar=FALSE)
+
+#create vocabulary
+vocabulary <- create_vocabulary(iterator)
+print(sum(vocabulary$term_count))
+
+```
+
+```{r}
+#dictionary 30000 words and UNK - unknown word (words too rare)
+pruned_vocabulary <- prune_vocabulary(vocabulary, vocab_term_max=vocabulary_size-1)%>%
+  select(-doc_count)
+pruned_vocabulary <- rbind(pruned_vocabulary, c("UNK",length(words_list) - sum(pruned_vocabulary$term_count))) %>%
+  mutate(id = seq(vocabulary_size))
+head(pruned_vocabulary)
+
+```
+Build dataset encode based on pruned_dictionary
+```{r}
+#remove large file to save memory space
+rm(corpus, iterator, vocabulary)
+
+#build
+cl <- parallel::makeCluster(8)
+doParallel::registerDoParallel(cl)
+data <- foreach(i = words_list, .combine = 'c') %dopar% {
+  pruned_vocabulary$id[which(pruned_vocabulary$term == i)]
+}
+parallel::stopCluster(cl)
+
+head(data,10)
+head(words_list,10)
+```
+
+Function to implement CBOW
+
+## Append elements in list
+```{r}
+lappend <- function (lst, ...){
+  lst <- c(lst, list(...))
+  return(lst)
+}
+
+```
+
+## Stochastic Gradient Descent Optimizer
+```{r}
+sgd_optimizer <- function( x0, step, iterations,
+                            dataset,
+                            context_window_size,
+                            PRINT_EVERY = 100
+                            # use_saved = FALSE,
+                            # save_dir = "saved_param_dir"
+                            ){
+  #Definition: stochastic gradien descent optimizer
+  #input :
+    #func: the function to optimize, it should take a single argument and yield 2 ouputs, 
+    #       a cost and a gradient with respect to the arguments
+    #x0: the initial point to start SGD from
+    #step: the step size for SGD
+    #iterations: total iterations to run SGD with
+    #save_dir; directory for saving parameters
+  
+  #ouput:
+    #x: the parameter value after SGD finishes
+    #cost_history: the history of cost function value
+  
+  #anneal learning rate every several iterations
+  anneal_every <- 5000
+  x = x0
+  start_iter <- 0
+  cost_history = c()
+  
+  expcost <- NULL
+  
+  for (iter in seq(start_iter + 1, iterations + 1)){
+    cost <- NULL
+    func <- word2vec_sgd_batch(x,dataset, context_window_size)
+    cost <- func$cost
+    grad <- func$grad
+    x <- x - (step * grad)
+    cost_history <- c(cost_history, cost)
+    
+    if (iter %% PRINT_EVERY == 0){ #every 100 iterations => print out
+      if( is.null(expcost)) expcost <- cost
+      else expcost <- 0.95 * expcost + 0.05 * cost
+      print(paste(">>>Iter", iter, expcost))
+    }
+    
+    if(iter %% anneal_every == 0){
+      step <- step * 0.5
+    }
+  }
+  
+  return (list (x = x, cost_history = cost_history))
+}
+```
+
+## word2vec stochastic gradient descent
+```{r}
+word2vec_sgd_batch <- function(word_vectors, dataset, context_size){
+  #run word2vec stochastic gradient descent for a set (batchsize) of
+  #randomly picked data
+  batchsize <- 50
+  cost <- 0
+  grad <- matrix(0, nrow = nrow(word_vectors), ncol = ncol(word_vectors))
+  N <- dim(word_vectors)[1]
+  input_vectors <- word_vectors[1:(N/2),]
+  output_vectors <- word_vectors[((N/2)+1):nrow(word_vectors),]
+  
+  for(i in seq(batchsize)){
+    c_size <- sample(1:context_size, 1)
+    res <- getRandomContext(c_size, dataset)
+    centerword <- res$centerword
+    context <- res$context
+    model <- cbow(centerword, c_size, context, input_vectors, output_vectors)
+    c <- model$cost
+    gin <- model$grad_in
+    gout <- model$grad_out
+    cost <- cost + (c/batchsize)
+    grad[1:(N/2),] <- grad[1:(N/2),] + (gin/batchsize)
+    grad[((N/2)+1):nrow(grad),] <- grad[((N/2)+1):nrow(grad),] + (gin/batchsize)
+    
+  }
+  
+  return (list(cost = cost, grad = grad ))
+}
+```
+
+## Get random context with given dataset and window size
+```{r}
+getRandomContext <- function(context_size, dataset){
+  span <- length(dataset)
+  centerword_idx <- sample(seq(span),1)
+  if (centerword_idx == 1) {
+    context <- (centerword_idx+1):(centerword_idx+context_size)  
+  }else {
+    context <- max(1, centerword_idx - context_size):(centerword_idx-1)
+    
+    if( centerword_idx + 1 <= span ){
+      context <- c(context ,(centerword_idx+1):min(span, centerword_idx+context_size))
+    }
+  }
+  
+  return(list(centerword = dataset[centerword_idx],
+              context =dataset[context]))
+}
+# test <- data[seq(20)]
+# getRandomContext(2, test)
+
+```
+
+## Continuous bag of words CBOW
+```{r}
+cbow <- function(center_word,context_size,context_words,
+                 input_vectors, output_vectors){
+  #definition: cbow model
+  #input:
+    #center_words: index of the current center word
+    #context_size: size of context window
+    #context_words: list of word indexs of context words
+    #input_vectors: word vectors from input to hidden layer, for lookup
+    #output_vectors: word vectors from hidden layer to final cost function
+    #we use softmax in this case 
+  #output:
+    #cost: evaluated cost value
+    #grad_in: gradient with the regard to input_vectors
+    #grad_out: gradient with the regard to output_vectors
+  
+  cost <- 0 
+  grad_in <- matrix(0, nrow(input_vectors),ncol(input_vectors))
+  grad_out <- matrix(0, nrow(output_vectors), ncol(output_vectors))
+  V <- dim(input_vectors)[1]
+  D <- dim(input_vectors)[2]
+  
+  onehot <- matrix(0, 2*context_size, V)
+  target_word_idx <- center_word
+  
+  for (i in seq(length(context_words))){
+    onehot[i,context_words[i]] <- onehot[i,context_words[i]] + 1
+  }
+  
+  d <- onehot %*% input_vectors
+  cbow_vec <- colSums(d)/(2*context_size) #average vector' weight, shape (1,D)
+  cost_func <- softmax_cost(cbow_vec, output_vectors, target_word_idx)
+  cost <- cost_func$cost
+  grad_out <- cost_func$dw
+  grad_cbow_vec <- cost_func$dx
+  
+  #
+  # print(context_words)
+  #
+  # print(dim(grad_cbow_vec))
+  
+  for (word in context_words){
+    #
+    # print(dim(grad_in[word,]))
+    
+    grad_in[word,] <- grad_in[word,] + grad_cbow_vec/(2*context_size)
+  }
+  
+  return (list (cost = cost, grad_in = grad_in, grad_out = grad_out))
+  
+}
+```
+
+## Softmax cost layer
+```{r}
+softmax_cost <- function(x, w, target_idx){
+  #definition: calculate softmax cost and gradient
+  #input:
+    #x: vector from previous layer, such as hidden layer
+    #w; weight for last layer, so called "output layer"
+    #target_idx; target word index, ground truth
+  #output:
+    #cost: softmax + cross entropy cost for curent predication 
+    #dw: gradient with regarding to weights
+    #dx: gradient with regarding to input vector
+  
+  V <- dim(w)[1]
+  D <- dim(w)[2]
+  # dim(x) <- D
+  prob <- softmax( x %*% t(w))
+  cost <- -log(prob[1,target_idx]) #cross entropy los, ground truth distribution is one hot
+  dcost <- prob
+  dcost[1, target_idx] <- dcost[1, target_idx] - 1
+  dw <- t(dcost) %*% x
+  dx <- dcost %*% w
+  
+  return (list(cost = cost , dw = dw, dx = dx))  
+}
+```
+
+## Softmax
+```{r}
+softmax <- function(x){
+  #calculate softmax based probability for given input vector
+  
+  x <- x - max(x)
+  exp_x <- exp(x)
+  p <- exp_x / sum(exp_x)
+  
+  return(p)
+  
+}
+```
+
+## Normalize vectors (matrix)
+```{r}
+normalize_vecs <- function(x){
+  #normalize each row of input matrix
+  #input : x - vectors (matrix)
+  #output: x - normalized vectors (matrix)
+  
+  xl_vec <- sqrt(rowSums(x^2))
+  x <- x/xl_vec
+  
+  return (x)
+}
+```
+
+Implementation section
+```{r}
+embedding_size <- 64
+
+word_vector <- normalize_vecs(
+  matrix(runif(2*vocabulary_size*embedding_size),
+         nrow = 2*vocabulary_size,
+         ncol = embedding_size))
+
+context_window_size <- 1
+
+optimizer <- sgd_optimizer(word_vector, 1, 30000, data, context_window_size)
+```
+
